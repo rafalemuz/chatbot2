@@ -1,22 +1,30 @@
 from flask import Flask, request, jsonify, render_template, redirect, url_for, send_file
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
-import json
-import csv
-import io
-import os
-import hmac
-import hashlib
+import json, csv, io, os, hmac, hashlib, requests
+
+# IA
+from openai import OpenAI
 
 app = Flask(__name__)
 
-# ----------------- CONFIG DB (SE MANTIENE SQLITE) -----------------
+# ---------------- CONFIG ----------------
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///metapython.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db = SQLAlchemy(app)
 
-# ----------------- MODELO -----------------
+# ---------------- IA ----------------
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# ---------------- WHATSAPP ----------------
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+
+# ---------------- SEGURIDAD ----------------
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "CHATCOURSE")
+APP_SECRET = os.getenv("APP_SECRET", "")
+
+# ---------------- MODELO ----------------
 class Log(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     fecha_y_hora = db.Column(db.DateTime, default=datetime.utcnow)
@@ -25,14 +33,10 @@ class Log(db.Model):
 with app.app_context():
     db.create_all()
 
-# ----------------- VARIABLES SEGURAS -----------------
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "CHATCOURSE")
-APP_SECRET = os.getenv("APP_SECRET", "")  # opcional pero recomendado
-
-# ----------------- SEGURIDAD META -----------------
+# ---------------- SEGURIDAD META ----------------
 def verificar_firma(req):
     if not APP_SECRET:
-        return True  # si no configuras secret, no bloquea
+        return True
 
     signature = req.headers.get("X-Hub-Signature-256")
     if not signature:
@@ -43,72 +47,108 @@ def verificar_firma(req):
     except:
         return False
 
-    if sha_name != 'sha256':
-        return False
-
     mac = hmac.new(
-        APP_SECRET.encode('utf-8'),
+        APP_SECRET.encode(),
         msg=req.get_data(),
         digestmod=hashlib.sha256
     )
 
     return hmac.compare_digest(mac.hexdigest(), signature)
 
-# ----------------- LOG -----------------
+# ---------------- LOG ----------------
 def agregar_mensaje_log(texto):
     try:
-        nuevo = Log(texto=texto)
-        db.session.add(nuevo)
+        db.session.add(Log(texto=texto))
         db.session.commit()
-    except Exception as e:
+    except:
         db.session.rollback()
-        print("Error guardando log:", e)
 
-def limpiar_logs():
+# ---------------- IA RESPUESTA ----------------
+def responder_con_ia(mensaje):
+    catalogo = """
+    Catálogo:
+    1. Playera - $200
+    2. Zapatos - $500
+    3. Gorra - $150
+    """
+
+    prompt = f"""
+    Eres un vendedor experto por WhatsApp.
+
+    OBJETIVO:
+    - Vender productos
+    - Responder dudas
+    - Guiar al cliente a comprar
+
+    {catalogo}
+
+    Cliente: {mensaje}
+    """
+
     try:
-        num = Log.query.delete()
-        db.session.commit()
-        return num
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        db.session.rollback()
-        print("Error limpiando:", e)
-        return 0
+        print("Error IA:", e)
+        return "Hubo un error, intenta nuevamente."
 
-# ----------------- RUTAS -----------------
-@app.route('/')
-def index():
-    keyword = request.args.get('keyword', '').strip()
+# ---------------- DETECTAR COMPRA ----------------
+def detectar_compra(texto):
+    palabras = ["comprar", "quiero", "pagar", "ordenar"]
+    return any(p in texto.lower() for p in palabras)
 
-    if keyword:
-        registros = Log.query.filter(Log.texto.contains(keyword)).order_by(Log.fecha_y_hora.desc()).all()
-    else:
-        registros = Log.query.order_by(Log.fecha_y_hora.desc()).all()
+# ---------------- GENERAR PEDIDO ----------------
+def generar_pedido(numero):
+    mensaje = "✅ Pedido generado.\nTotal: $200\nGracias por tu compra 🎉"
+    enviar_respuesta(numero, mensaje)
 
-    return render_template('index.html', registros=registros, keyword=keyword)
+# ---------------- ENVIAR WHATSAPP ----------------
+def enviar_respuesta(numero, mensaje):
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print("Faltan credenciales WhatsApp")
+        return
 
-# ----------------- WEBHOOK -----------------
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": numero,
+        "type": "text",
+        "text": {"body": mensaje}
+    }
+
+    try:
+        requests.post(url, headers=headers, json=payload)
+    except Exception as e:
+        print("Error enviando:", e)
+
+# ---------------- WEBHOOK ----------------
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
-        return verificar_token(request)
+        token = request.args.get('hub.verify_token')
+        challenge = request.args.get('hub.challenge')
 
-    # 🔐 Validación firma Meta
+        if token == VERIFY_TOKEN:
+            return challenge
+        return "Error", 403
+
     if not verificar_firma(request):
         return jsonify({'error': 'Firma inválida'}), 403
 
     return recibir_mensajes(request)
 
-def verificar_token(req):
-    token = req.args.get('hub.verify_token')
-    challenge = req.args.get('hub.challenge')
-
-    if challenge and token == VERIFY_TOKEN:
-        return challenge
-
-    return jsonify({'error': 'Token inválido'}), 401
-
+# ---------------- PROCESAMIENTO ----------------
 def recibir_mensajes(req):
-    # Protección básica
+
     if req.content_length and req.content_length > 1024 * 1024:
         return jsonify({'error': 'Payload muy grande'}), 413
 
@@ -117,25 +157,50 @@ def recibir_mensajes(req):
     if not data:
         return jsonify({'error': 'JSON no recibido'}), 400
 
-    texto = json.dumps(data, indent=2)
-    agregar_mensaje_log(texto)
+    agregar_mensaje_log(json.dumps(data, indent=2))
 
-    # Aquí podrías integrar IA o lógica de WhatsApp después
+    try:
+        entry = data.get("entry", [])
+
+        for e in entry:
+            for change in e.get("changes", []):
+                value = change.get("value", {})
+                mensajes = value.get("messages", [])
+
+                for msg in mensajes:
+                    numero = msg.get("from")
+
+                    if msg.get("type") == "text":
+                        texto = msg["text"]["body"]
+
+                        # 🧠 IA
+                        respuesta = responder_con_ia(texto)
+
+                        # 💰 Detectar compra
+                        if detectar_compra(texto):
+                            generar_pedido(numero)
+                        else:
+                            enviar_respuesta(numero, respuesta)
+
+    except Exception as e:
+        print("Error:", e)
+
     return jsonify({'message': 'EVENT_RECEIVED'}), 200
 
-# ----------------- UTILIDADES -----------------
-@app.route('/limpiar')
-def limpiar():
-    limpiar_logs()
-    return redirect(url_for('index'))
+# ---------------- PANEL ----------------
+@app.route('/')
+def index():
+    registros = Log.query.order_by(Log.fecha_y_hora.desc()).all()
+    return render_template('index.html', registros=registros)
 
+# ---------------- EXPORTAR ----------------
 @app.route('/exportar')
 def exportar():
-    registros = Log.query.order_by(Log.fecha_y_hora.asc()).all()
+    registros = Log.query.all()
 
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(['ID', 'Fecha', 'Texto'])
+    cw.writerow(['ID','Fecha','Texto'])
 
     for r in registros:
         cw.writerow([r.id, r.fecha_y_hora, r.texto])
@@ -144,13 +209,8 @@ def exportar():
     output.write(si.getvalue().encode('utf-8'))
     output.seek(0)
 
-    return send_file(
-        output,
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name='logs.csv'
-    )
+    return send_file(output, mimetype='text/csv', as_attachment=True, download_name='logs.csv')
 
-# ----------------- MAIN -----------------
+# ---------------- RUN ----------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
