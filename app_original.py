@@ -4,61 +4,32 @@ from datetime import datetime
 import json
 import csv
 import io
-import os
-import hmac
-import hashlib
 
 app = Flask(__name__)
 
-# ----------------- CONFIG DB (SE MANTIENE SQLITE) -----------------
+# Configuración de la base de datos SQLite
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///metapython.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db = SQLAlchemy(app)
 
-# ----------------- MODELO -----------------
+# Modelo de la tabla log
 class Log(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     fecha_y_hora = db.Column(db.DateTime, default=datetime.utcnow)
     texto = db.Column(db.Text)
 
+# Crear la tabla si no existe
 with app.app_context():
     db.create_all()
 
-# ----------------- VARIABLES SEGURAS -----------------
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "CHATCOURSE")
-APP_SECRET = os.getenv("APP_SECRET", "")  # opcional pero recomendado
+# TOKEN de verificación
+TOKEN_CHATCOURSE = "CHATCOURSE"
 
-# ----------------- SEGURIDAD META -----------------
-def verificar_firma(req):
-    if not APP_SECRET:
-        return True  # si no configuras secret, no bloquea
-
-    signature = req.headers.get("X-Hub-Signature-256")
-    if not signature:
-        return False
-
-    try:
-        sha_name, signature = signature.split('=')
-    except:
-        return False
-
-    if sha_name != 'sha256':
-        return False
-
-    mac = hmac.new(
-        APP_SECRET.encode('utf-8'),
-        msg=req.get_data(),
-        digestmod=hashlib.sha256
-    )
-
-    return hmac.compare_digest(mac.hexdigest(), signature)
-
-# ----------------- LOG -----------------
+# ----------------- FUNCIONES DE LOG -----------------
 def agregar_mensaje_log(texto):
     try:
-        nuevo = Log(texto=texto)
-        db.session.add(nuevo)
+        nuevo_registro = Log(texto=texto)
+        db.session.add(nuevo_registro)
         db.session.commit()
     except Exception as e:
         db.session.rollback()
@@ -71,86 +42,59 @@ def limpiar_logs():
         return num
     except Exception as e:
         db.session.rollback()
-        print("Error limpiando:", e)
         return 0
 
 # ----------------- RUTAS -----------------
 @app.route('/')
 def index():
     keyword = request.args.get('keyword', '').strip()
-
     if keyword:
         registros = Log.query.filter(Log.texto.contains(keyword)).order_by(Log.fecha_y_hora.desc()).all()
     else:
         registros = Log.query.order_by(Log.fecha_y_hora.desc()).all()
-
     return render_template('index.html', registros=registros, keyword=keyword)
 
-# ----------------- WEBHOOK -----------------
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
         return verificar_token(request)
-
-    # 🔐 Validación firma Meta
-    if not verificar_firma(request):
-        return jsonify({'error': 'Firma inválida'}), 403
-
-    return recibir_mensajes(request)
+    if request.method == 'POST':
+        return recibir_mensajes(request)
 
 def verificar_token(req):
     token = req.args.get('hub.verify_token')
     challenge = req.args.get('hub.challenge')
-
-    if challenge and token == VERIFY_TOKEN:
+    if challenge and token == TOKEN_CHATCOURSE:
         return challenge
-
-    return jsonify({'error': 'Token inválido'}), 401
+    else:
+        return jsonify({'error': 'Token invalido'}), 401
 
 def recibir_mensajes(req):
-    # Protección básica
-    if req.content_length and req.content_length > 1024 * 1024:
-        return jsonify({'error': 'Payload muy grande'}), 413
-
     data = req.get_json(silent=True)
-
     if not data:
         return jsonify({'error': 'JSON no recibido'}), 400
-
     texto = json.dumps(data, indent=2)
     agregar_mensaje_log(texto)
-
-    # Aquí podrías integrar IA o lógica de WhatsApp después
     return jsonify({'message': 'EVENT_RECEIVED'}), 200
 
-# ----------------- UTILIDADES -----------------
 @app.route('/limpiar')
 def limpiar():
-    limpiar_logs()
+    num = limpiar_logs()
     return redirect(url_for('index'))
 
 @app.route('/exportar')
 def exportar():
     registros = Log.query.order_by(Log.fecha_y_hora.asc()).all()
-
     si = io.StringIO()
     cw = csv.writer(si)
-    cw.writerow(['ID', 'Fecha', 'Texto'])
-
+    cw.writerow(['ID','Fecha','Texto'])
     for r in registros:
         cw.writerow([r.id, r.fecha_y_hora, r.texto])
-
     output = io.BytesIO()
     output.write(si.getvalue().encode('utf-8'))
     output.seek(0)
-
-    return send_file(
-        output,
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name='logs.csv'
-    )
+    return send_file(output, mimetype='text/csv', as_attachment=True, attachment_filename='logs.csv')
 
 # ----------------- MAIN -----------------
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+    app.run(host='0.0.0.0', port=80, debug=True)
