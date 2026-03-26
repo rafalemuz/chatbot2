@@ -4,27 +4,27 @@ from datetime import datetime
 import json
 import csv
 import io
- 
+
 app = Flask(__name__)
- 
+
 # Configuración de la base de datos SQLite
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///metapython.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
- 
+
 # Modelo de la tabla log
 class Log(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     fecha_y_hora = db.Column(db.DateTime, default=datetime.utcnow)
     texto = db.Column(db.Text)
- 
+
 # Crear la tabla si no existe
 with app.app_context():
     db.create_all()
- 
+
 # TOKEN de verificación
-TOKEN_CHATCOURSE = "VALCODE"
- 
+TOKEN_CHATCOURSE = "CHATCOURSE"
+
 # ----------------- FUNCIONES DE LOG -----------------
 def agregar_mensaje_log(texto):
     try:
@@ -34,7 +34,7 @@ def agregar_mensaje_log(texto):
     except Exception as e:
         db.session.rollback()
         print("Error guardando log:", e)
- 
+
 def limpiar_logs():
     try:
         num = Log.query.delete()
@@ -43,7 +43,7 @@ def limpiar_logs():
     except Exception as e:
         db.session.rollback()
         return 0
- 
+
 # ----------------- RUTAS -----------------
 @app.route('/')
 def index():
@@ -53,14 +53,14 @@ def index():
     else:
         registros = Log.query.order_by(Log.fecha_y_hora.desc()).all()
     return render_template('index.html', registros=registros, keyword=keyword)
- 
+
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
         return verificar_token(request)
     if request.method == 'POST':
         return recibir_mensajes(request)
- 
+
 def verificar_token(req):
     token = req.args.get('hub.verify_token')
     challenge = req.args.get('hub.challenge')
@@ -68,7 +68,7 @@ def verificar_token(req):
         return challenge
     else:
         return jsonify({'error': 'Token inválido'}), 401
- 
+
 def recibir_mensajes(req):
     data = req.get_json(silent=True)
     if not data:
@@ -76,12 +76,12 @@ def recibir_mensajes(req):
     texto = json.dumps(data, indent=2)
     agregar_mensaje_log(texto)
     return jsonify({'message': 'EVENT_RECEIVED'}), 200
- 
+
 @app.route('/limpiar')
 def limpiar():
     num = limpiar_logs()
     return redirect(url_for('index'))
- 
+
 @app.route('/exportar')
 def exportar():
     registros = Log.query.order_by(Log.fecha_y_hora.asc()).all()
@@ -94,7 +94,7 @@ def exportar():
     output.write(si.getvalue().encode('utf-8'))
     output.seek(0)
     return send_file(output, mimetype='text/csv', as_attachment=True, attachment_filename='logs.csv')
- 
+
 # ----------------- MAIN -----------------
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80, debug=True)
